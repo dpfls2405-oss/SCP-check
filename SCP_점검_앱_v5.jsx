@@ -147,17 +147,6 @@ function readCsvAuto(file) {
 // ═══════════════════════════════════════════════════════
 // 파일 파싱
 // ═══════════════════════════════════════════════════════
-function parseUnderItems(wb) {
-  const arr = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,defval:""});
-  const items = [];
-  for(let i=3;i<arr.length;i++){
-    const r=arr[i], combo=String(r[2]||"").trim();
-    if(!combo||combo==="nan") continue;
-    items.push({ line:String(r[1]||"").trim(), combo, name:String(r[3]||"").trim(),
-      tgt3월:toN(r[5])??0, 실적2월:toN(r[7])??0, 평출3개월:toN(r[11])??0, 평출1년:toN(r[12])??0 });
-  }
-  return items;
-}
 
 function buildLtMaps(rows) {
   const hi=rows.findIndex(r=>String(r[0]||"").trim()==="CODE");
@@ -251,15 +240,29 @@ function calcTarget(ltMaps,demand,combo,bizDays) {
   };
 }
 
+// parseScp: scpMap만 반환 (내부용)
 function parseScp(wb) {
-  const shName=wb.SheetNames.find(s=>s.includes("시디즈")&&s.includes("SCP"))||wb.SheetNames[0];
+  const {scpMap}=parseScpFull(wb);
+  return scpMap;
+}
+// parseScpFull: scpMap + allCombos(품목 전체 목록) 반환
+function parseScpFull(wb) {
+  // 시디즈 의자 SCP 시트 우선, 없으면 첫 번째 시트
+  const shName=wb.SheetNames.find(s=>s.includes("시디즈")&&s.includes("SCP"))
+             ||wb.SheetNames.find(s=>s.includes("SCP"))
+             ||wb.SheetNames[0];
   const arr=XLSX.utils.sheet_to_json(wb.Sheets[shName],{header:1,defval:""});
-  const map={};
+  const scpMap={};
+  const allCombos=[];
   for(let i=3;i<arr.length;i++){
-    const r=arr[i], combo=String(r[4]||"").trim(); if(!combo) continue;
-    map[combo]={ sell:toN(r[22]), stock:toN(r[24]), name:String(r[5]||"").trim() };
+    const r=arr[i], combo=String(r[4]||"").trim();
+    if(!combo||combo.length<3) continue;
+    const name=String(r[5]||"").trim();
+    const sell=toN(r[22]), stock=toN(r[24]);
+    scpMap[combo]={sell, stock, name};
+    allCombos.push({combo, name});
   }
-  return map;
+  return {scpMap, allCombos};
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1241,53 +1244,78 @@ function TabCapa({rows,bizDays,capaMap}) {
 // 메인 앱
 // ═══════════════════════════════════════════════════════
 export default function App() {
-  const [underFile, setUnderFile] = useState(null);
-  const [ltFile,    setLtFile]    = useState(null);
-  const [scpFile,   setScpFile]   = useState(null);
-  const [outFile,   setOutFile]   = useState(null);
-  const [rows,      setRows]      = useState(null);
-  const [bizDays,   setBizDays]   = useState(22);
-  const [loading,   setLoading]   = useState(false);
-  const [error,     setError]     = useState("");
-  const [tab,       setTab]       = useState("main");
-  const [filter,    setFilter]    = useState("전체");
-  const [sortKey,   setSortKey]   = useState("라인순");
-  const [month,     setMonth]     = useState("3월");
-  const [capaMap,   setCapaMap]   = useState({});   // 라인별 CAPA 설정
-  const [gridResult,setGridResult]= useState(null); // Grid00 분석 결과
+  const [ltFile,     setLtFile]    = useState(null);
+  const [scpFile,    setScpFile]   = useState(null);
+  const [outFile,    setOutFile]   = useState(null);
+  const [lineFile,   setLineFile]  = useState(null);  // 포장라인 매핑 (선택)
+  const [rows,       setRows]      = useState(null);
+  const [bizDays,    setBizDays]   = useState(22);
+  const [loading,    setLoading]   = useState(false);
+  const [error,      setError]     = useState("");
+  const [tab,        setTab]       = useState("main");
+  const [filter,     setFilter]    = useState("전체");
+  const [sortKey,    setSortKey]   = useState("라인순");
+  const [month,      setMonth]     = useState("3월");
+  const [capaMap,    setCapaMap]   = useState({});
+  const [gridResult, setGridResult]= useState(null);
+
+  // ── 포장라인 매핑 파싱: combo → line ───────────────────
+  async function parseLineMap(file) {
+    if(!file) return {};
+    let rows2;
+    if(file.name.toLowerCase().endsWith(".csv"))
+      rows2=await new Promise((res,rej)=>Papa.parse(file,{header:false,skipEmptyLines:true,complete:r=>res(r.data),error:rej}));
+    else { const wb=await readXlsx(file); rows2=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,defval:""}); }
+    // 헤더 탐지: combo/조합코드 컬럼, line/포장라인 컬럼
+    const hi=rows2.findIndex(r=>r.some(v=>String(v).includes("조합")||String(v).toLowerCase().includes("combo")));
+    const data=hi>=0?rows2.slice(hi+1):rows2.slice(1);
+    const hdr=hi>=0?rows2[hi].map(v=>String(v).trim()):[];
+    const ci=k=>hdr.findIndex(h=>h.includes(k));
+    const comboC = hi>=0?(ci("조합")>=0?ci("조합"):ci("combo")>=0?ci("combo"):0):0;
+    const lineC  = hi>=0?(ci("라인")>=0?ci("라인"):ci("line")>=0?ci("line"):1):1;
+    const map={};
+    data.forEach(r=>{ const c=String(r[comboC]||"").trim(), l=String(r[lineC]||"").trim(); if(c&&l)map[c]=l; });
+    return map;
+  }
 
   const run = useCallback(async () => {
-    if (!underFile||!ltFile||!scpFile||!outFile) { setError("4개 파일을 모두 업로드하세요."); return; }
+    if (!ltFile||!scpFile||!outFile) { setError("③ SCP·② 제조LT·④ 출고내역 3개 파일을 업로드하세요."); return; }
     setLoading(true); setError("");
     try {
+      // LT 파싱
       let ltRows;
       if(ltFile.name.toLowerCase().endsWith(".csv"))
         ltRows=await new Promise((res,rej)=>Papa.parse(ltFile,{header:false,skipEmptyLines:true,complete:r=>res(r.data),error:rej}));
       else { const wb=await readXlsx(ltFile); ltRows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,defval:""}); }
       const ltMaps=buildLtMaps(ltRows);
 
+      // 출고내역 파싱
       let outRows;
       if(outFile.name.toLowerCase().endsWith(".csv")) outRows=await readCsvAuto(outFile);
       else { const wb=await readXlsx(outFile); outRows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,defval:""}); }
       const demand=buildDemand(outRows);
 
-      const scpWb=await readXlsx(scpFile); const scpMap=parseScp(scpWb);
-      const underWb=await readXlsx(underFile); const underItems=parseUnderItems(underWb);
-      if(!underItems.length) throw new Error("과소품목 파일에서 데이터를 읽지 못했습니다.");
+      // SCP 파싱 → 전체 품목 자동 추출
+      const scpWb=await readXlsx(scpFile);
+      const {scpMap, allCombos}=parseScpFull(scpWb);
+      if(!allCombos.length) throw new Error("SCP 파일에서 품목을 읽지 못했습니다. 시트명에 'SCP'가 포함되어야 합니다.");
 
-      const result=underItems.map(item=>{
-        const stat=calcTarget(ltMaps,demand,item.combo,bizDays);
-        const scp=scpMap[item.combo]||{};
-        return { combo:item.combo, line:item.line, name:item.name||scp.name||"",
+      // 포장라인 매핑 (선택 파일)
+      const lineMap = await parseLineMap(lineFile);
+
+      const result=allCombos.map(({combo, name})=>{
+        const stat=calcTarget(ltMaps,demand,combo,bizDays);
+        const scp=scpMap[combo]||{};
+        const line=lineMap[combo]||"—";
+        return { combo, line, name: name||scp.name||"",
           ...stat, scpStock:scp.stock??null, scpSell:scp.sell??null,
-          tgt3월:item.tgt3월, 실적2월:item.실적2월, 평출3개월:item.평출3개월, 평출1년:item.평출1년,
           stockVerdict:judgeStock(scp.stock,stat.tgt97), sellVerdict:judgeSell(scp.sell,stat.mu월) };
       });
       result.sort((a,b)=>a.line.localeCompare(b.line)||a.combo.localeCompare(b.combo));
       setRows(result); setTab("main");
     } catch(e) { console.error(e); setError("오류: "+e.message); }
     setLoading(false);
-  },[underFile,ltFile,scpFile,outFile,bizDays]);
+  },[ltFile,scpFile,outFile,lineFile,bizDays]);
 
   const summary=useMemo(()=>{
     if(!rows) return null;
@@ -1308,7 +1336,7 @@ export default function App() {
     {key:"line",   label:"🏭 라인별 요약"},
     {key:"capaset",label:"⚙️ CAPA 설정"},
   ];
-  const allReady=underFile&&ltFile&&scpFile&&outFile;
+  const allReady=ltFile&&scpFile&&outFile;
 
   return (
     <div style={{fontFamily:"'Malgun Gothic','Apple SD Gothic Neo',sans-serif",minHeight:"100vh",background:"#F1F5F9"}}>
@@ -1317,7 +1345,7 @@ export default function App() {
         <div>
           <div style={{fontWeight:800,fontSize:15,color:"#fff"}}>시디즈 평택 SCP 적정성 점검</div>
           <div style={{fontSize:10,color:"#93C5FD",marginTop:1}}>
-            제조LT + 출고실적 기반 권장값 vs SCP 목표재고·판매예측(수량) | 과소품목 기준
+            제조LT + 출고실적 기반 권장값 vs SCP 목표재고·판매예측(수량) | SCP 전체 품목 기준
           </div>
         </div>
         <select value={month} onChange={e=>setMonth(e.target.value)} style={{marginLeft:"auto",
@@ -1327,28 +1355,57 @@ export default function App() {
       </div>
 
       <div style={{maxWidth:1700,margin:"0 auto",padding:"16px"}}>
+
+        {/* ── 업로드 & 실행 패널 ── */}
         <div style={{background:"#fff",borderRadius:12,padding:18,marginBottom:14,boxShadow:"0 1px 4px rgba(0,0,0,.07)"}}>
-          <div style={{fontWeight:700,fontSize:12,color:"#374151",marginBottom:12}}>📁 분석 파일 업로드 ({month} 기준)</div>
+          <div style={{fontWeight:700,fontSize:12,color:"#374151",marginBottom:4}}>📁 분석 파일 업로드 ({month} 기준)</div>
+          <div style={{fontSize:10,color:"#6B7280",marginBottom:12,background:"#F8FAFC",padding:"6px 10px",borderRadius:8}}>
+            💡 <b>SCP 파일의 전체 품목을 자동으로 분석합니다.</b>
+            포장라인 정보가 필요하면 ④ 포장라인 매핑 파일을 추가하세요 (선택).
+          </div>
           <div style={{display:"flex",gap:10,alignItems:"flex-end",flexWrap:"wrap"}}>
-            <UploadZone label="① 과소품목 목록" icon="📋" hint="시디즈평택_과소품목_vN.xlsx" file={underFile} onFile={setUnderFile}/>
-            <UploadZone label="② 품목별 제조 LT" icon="⚙️" hint="CODE·리드타임 컬럼 CSV/XLSX" file={ltFile} onFile={setLtFile}/>
-            <UploadZone label={`③ SCP 자료 (${month})`} icon="📅" hint="시디즈 의자 SCP 시트 포함 XLSX" file={scpFile} onFile={setScpFile}/>
-            <UploadZone label="④ 과거 출고 내역" icon="📦" hint="평택의자 출고량 CSV/XLSX" file={outFile} onFile={setOutFile}/>
+
+            {/* ① 제조 LT */}
+            <UploadZone label="① 품목별 제조 LT" icon="⚙️"
+              hint="CODE·리드타임 컬럼 포함 CSV/XLSX" file={ltFile} onFile={setLtFile}/>
+
+            {/* ② SCP */}
+            <UploadZone label={`② SCP 자료 (${month})`} icon="📅"
+              hint="시디즈 의자 SCP 시트 포함 XLSX" file={scpFile} onFile={setScpFile}/>
+
+            {/* ③ 출고내역 */}
+            <UploadZone label="③ 과거 출고 내역" icon="📦"
+              hint="평택의자 출고량 CSV/XLSX" file={outFile} onFile={setOutFile}/>
+
+            {/* ④ 포장라인 매핑 (선택) */}
+            <div style={{display:"flex",flexDirection:"column",gap:4,flex:1,minWidth:130}}>
+              <UploadZone label="④ 포장라인 매핑 (선택)" icon="🏭"
+                hint={"조합코드, 포장라인\nCSV/XLSX (없으면 '—')"} file={lineFile} onFile={setLineFile}/>
+              {lineFile&&<button onClick={()=>setLineFile(null)}
+                style={{fontSize:10,padding:"2px 8px",borderRadius:6,border:"1px solid #FCA5A5",
+                  background:"#FEF2F2",color:"#DC2626",cursor:"pointer",alignSelf:"flex-end"}}>
+                ✕ 제거
+              </button>}
+            </div>
+
+            {/* 실행 버튼 */}
             <div style={{flexShrink:0,display:"flex",flexDirection:"column",gap:8,minWidth:120}}>
               <div style={{display:"flex",gap:6,alignItems:"center",justifyContent:"center"}}>
                 <label style={{fontSize:11,color:"#374151",fontWeight:600}}>영업일</label>
                 <input type="number" value={bizDays} min={1} max={31}
                   onChange={e=>setBizDays(Number(e.target.value))}
-                  style={{width:50,padding:"4px 6px",borderRadius:8,border:"1.5px solid #E5E7EB",fontSize:12,fontWeight:700,textAlign:"center"}}/>
+                  style={{width:50,padding:"4px 6px",borderRadius:8,border:"1.5px solid #E5E7EB",
+                    fontSize:12,fontWeight:700,textAlign:"center"}}/>
                 <span style={{fontSize:11,color:"#9CA3AF"}}>일</span>
               </div>
               <button onClick={run} disabled={loading||!allReady}
                 style={{padding:"12px 20px",borderRadius:10,border:"none",
-                  background:!allReady?"#CBD5E1":"#1E3A5F",color:"#fff",fontWeight:800,fontSize:13,cursor:"pointer",whiteSpace:"nowrap"}}>
+                  background:!allReady?"#CBD5E1":"#1E3A5F",color:"#fff",
+                  fontWeight:800,fontSize:13,cursor:"pointer",whiteSpace:"nowrap"}}>
                 {loading?"⏳ 분석 중…":"▶ 분석 실행"}
               </button>
               <div style={{fontSize:10,textAlign:"center",color:allReady?"#059669":"#9CA3AF"}}>
-                {allReady?"✓ 준비 완료":"4개 파일 필요"}
+                {allReady?"✓ 준비 완료":"① ② ③ 필수"}
               </div>
             </div>
           </div>
@@ -1375,39 +1432,43 @@ export default function App() {
           </div>
         </div>}
 
-        {(rows||tab==="capaset")&&<div style={{background:"#fff",borderRadius:12,padding:20,boxShadow:"0 1px 4px rgba(0,0,0,.07)"}}>
+        {/* ── 탭 패널: CAPA 설정은 항상, 나머지는 분석 후 ── */}
+        <div style={{background:"#fff",borderRadius:12,padding:20,boxShadow:"0 1px 4px rgba(0,0,0,.07)"}}>
           <Tabs items={TABS} active={tab} onChange={setTab}/>
-          {tab==="main"    && rows && <TabMain  rows={rows} filter={filter} setFilter={setFilter} sortKey={sortKey} setSortKey={setSortKey}/>}
-          {tab==="calc"    && rows && <TabCalc  rows={rows}/>}
-          {tab==="terms"   && <TabTerms/>}
-          {tab==="line"    && rows && <TabLine  rows={rows}/>}
-          {tab==="capaset" && <TabCapaSettings capaMap={capaMap} setCapaMap={setCapaMap} gridResult={gridResult} setGridResult={setGridResult}/>}
-          {!rows&&tab!=="capaset"&&tab!=="terms"&&<div style={{padding:40,textAlign:'center',color:'#9CA3AF',fontSize:13}}>
-            먼저 위에서 4개 파일을 업로드하고 분석을 실행하세요.
-          </div>}
-        </div>}
-
-        {!rows&&!loading&&tab!=="capaset"&&<div style={{background:"#fff",borderRadius:12,padding:40,
-          textAlign:"center",boxShadow:"0 1px 4px rgba(0,0,0,.07)"}}>
-          <div style={{fontSize:44,marginBottom:14}}>📊</div>
-          <div style={{fontWeight:700,fontSize:15,color:"#1E3A5F",marginBottom:10}}>파일 4개를 업로드하고 분석을 실행하세요</div>
-          <div style={{fontSize:12,lineHeight:2.4,color:"#6B7280"}}>
-            <b style={{color:"#374151"}}>① 과소품목 목록</b> — 시디즈평택_과소품목_vN.xlsx<br/>
-            <b style={{color:"#374151"}}>② 품목별 제조 LT</b> — CODE·리드타임 컬럼 포함 CSV/XLSX<br/>
-            <b style={{color:"#374151"}}>③ SCP 자료</b> — 해당 월 XLSX (시디즈 의자 SCP 시트 자동 탐색)<br/>
-            <b style={{color:"#374151"}}>④ 과거 출고 내역</b> — 평택의자 출고량 CSV/XLSX<br/>
-          </div>
-          <div style={{marginTop:14,padding:"10px 16px",background:"#EFF6FF",borderRadius:10,
-            display:"inline-block",fontSize:11,color:"#1E40AF",lineHeight:1.8,textAlign:"left",border:"1px solid #BFDBFE"}}>
-            💡 <b>⚙️ CAPA 설정 탭</b>은 분석 전에도 접근 가능합니다.<br/>
-            Grid00 파일을 업로드하면 라인별 일일 CAPA가 자동 산출됩니다.
-          </div>
-          <div style={{marginTop:14,padding:"12px 20px",background:"#F8FAFC",borderRadius:10,
-            display:"inline-block",fontSize:10,color:"#9CA3AF",lineHeight:1.8,textAlign:"left",marginLeft:8}}>
-            목표재고: 심각부족&lt;70% / 부족 70~99% / 적정 100~119% / 과잉≥120% (vs 권장97%)<br/>
-            판매예측: 심각부족&lt;50% / 부족 50~79% / 적정 80~129% / 과잉≥130% (vs 최근3개월평균, 수량)
-          </div>
-        </div>}
+          {tab==="capaset"
+            ? <TabCapaSettings capaMap={capaMap} setCapaMap={setCapaMap}
+                gridResult={gridResult} setGridResult={setGridResult}/>
+            : rows
+              ? <>
+                  {tab==="main"  && <TabMain rows={rows} filter={filter} setFilter={setFilter} sortKey={sortKey} setSortKey={setSortKey}/>}
+                  {tab==="calc"  && <TabCalc rows={rows}/>}
+                  {tab==="terms" && <TabTerms/>}
+                  {tab==="line"  && <TabLine rows={rows}/>}
+                </>
+              : tab==="terms"
+                ? <TabTerms/>
+                : <div style={{padding:"48px 0",textAlign:"center",color:"#9CA3AF"}}>
+                    <div style={{fontSize:40,marginBottom:12}}>📊</div>
+                    <div style={{fontWeight:700,fontSize:14,color:"#374151",marginBottom:8}}>
+                      ① ② ③ 파일 업로드 후 분석을 실행하세요
+                    </div>
+                    <div style={{fontSize:11,lineHeight:2,color:"#6B7280"}}>
+                      <b>① 품목별 제조 LT</b> — CODE·리드타임 컬럼 포함 CSV/XLSX<br/>
+                      <b>② SCP 자료</b> — 시디즈 의자 SCP 시트 포함 XLSX (전체 품목 자동 추출)<br/>
+                      <b>③ 과거 출고 내역</b> — 평택의자 출고량 CSV/XLSX<br/>
+                      <b>④ 포장라인 매핑</b> — 조합코드↔포장라인 CSV/XLSX <span style={{color:"#9CA3AF"}}>(선택)</span>
+                    </div>
+                    <div style={{marginTop:12,display:"inline-flex",gap:8,flexWrap:"wrap",
+                      justifyContent:"center",fontSize:10,color:"#374151"}}>
+                      <span style={{padding:"4px 12px",borderRadius:99,background:"#EFF6FF",color:"#1E40AF",fontWeight:700}}>
+                        LT 매핑: combo 직접 → 단품코드 평균 → 앞 3글자 평균 → 기본값 6일
+                      </span>
+                      <span style={{padding:"4px 12px",borderRadius:99,background:"#F0FDF4",color:"#065F46",fontWeight:700}}>
+                        ⚙️ CAPA 설정은 지금 바로 사용 가능
+                      </span>
+                    </div>
+                  </div>}
+        </div>
       </div>
     </div>
   );
